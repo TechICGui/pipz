@@ -38,4 +38,4 @@ jobs:
         env:
           PIPZ_TOKEN: ${{ secrets.PIPZ_TOKEN }}
           DB_URL: ${{ secrets.DB_URL }}
-        run: python main.py.
+        run: python main.py
