@@ -5,7 +5,8 @@ import os
 from sqlalchemy import create_engine, text
 
 # Captura de variáveis de ambiente
-PIPZ_TOKEN = os.getenv("PIPZ_TOKEN")
+PIPZ_KEY = os.getenv("PIPZ_TOKEN")    # Sua API Key
+PIPZ_SECRET = os.getenv("PIPZ_SECRET") # Sua API Secret
 DB_URL = os.getenv("DB_URL")
 
 def fetch_pipz(list_id):
@@ -13,14 +14,27 @@ def fetch_pipz(list_id):
     offset = 0
     limit = 1000
     while True:
-        url = f"https://campuscaldeira.pipz.io/api/v1/contact/?list_id={list_id}&limit={limit}&offset={offset}&extra_fields=1"
-        res = requests.get(url, headers={"Authorization": f"Bearer {PIPZ_TOKEN}", "Accept": "application/json"})
+        # Passando as credenciais diretamente na Query (Padrão Pipz)
+        url = f"https://campuscaldeira.pipz.io/api/v1/contact/"
+        params = {
+            "list_id": list_id,
+            "limit": limit,
+            "offset": offset,
+            "extra_fields": "1",
+            "api_key": PIPZ_KEY,
+            "api_secret": PIPZ_SECRET
+        }
+        
+        res = requests.get(url, params=params, headers={"Accept": "application/json"})
+        
         if res.status_code == 429:
+            print("Pipz pediu para esperar (429)...")
             time.sleep(15)
             continue
         if res.status_code != 200:
-            print(f"Erro na API Pipz: {res.status_code}")
+            print(f"Erro na API Pipz: {res.status_code} - {res.text}")
             break
+            
         data = res.json()
         objs = data.get('objects', [])
         if not objs: break

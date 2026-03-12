@@ -37,5 +37,6 @@ jobs:
       - name: Executar Script
         env:
           PIPZ_TOKEN: ${{ secrets.PIPZ_TOKEN }}
+          PIPZ_SECRET: ${{ secrets.PIPZ_SECRET }}
           DB_URL: ${{ secrets.DB_URL }}
         run: python main.py
