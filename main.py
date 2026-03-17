@@ -115,7 +115,7 @@ def process():
                         # --- LP1 (Fallback Alumni do CSV) ---
                         if handler == "lp1":
                             sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem")
-                            cod = f.get("gc_2026_codigo_alumni") or f.get("[GC2026] codigo alumni") or f.get("contact_custom_gc2026_codigo_alumni")
+                            cod = f.get("gc_2026_codigo_alumni") or f.get("[GC2026] codigo alumni") or f.get("contact_custom_gc2026_codigo_alumni") or f.get("gc2026_codigo_alumni")
                             
                             conn.execute(text("""
                                 INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
@@ -129,31 +129,64 @@ def process():
                             })
 
                         # --- LP2 (Fallbacks Custom do CSV) ---
+                        # --- LP2 (Mapeamento Completo com Fallbacks do CSV) ---
                         if handler == "lp2":
-                            # Gênero
+                            # Gênero (Lógica de prioridade)
                             gen = normalize_genero(
                                 f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), 
                                 f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero")
                             )
-                            # Etnia
+                            # Etnia (Mescla campos abertos e fechados)
                             etn = normalize_etnia(
                                 f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"),
                                 f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia")
                             )
-                            # Trilha e Escola
+                            
+                            # Mapeamento de campos simples (Direto do f.get)
                             tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
                             esc = f.get("gc_2026_lp2_qual_escola") or f.get("Nome da escola") or f.get("contact_custom_gc_2026_lp2_qual_escola")
+                            ens_med = f.get("contact_custom_gc_2026_lp2_ensino_medio")
+                            tip_esc = f.get("contact_custom_gc_2026_escola_publica_ou_privada")
+                            semestre = f.get("contact_custom_gc_2026_lp2_qual_semestre_ano")
+                            tur_esc = f.get("contact_custom_gc_2026_lp2_qual_turno")
+                            pcd_val = f.get("contact_custom_gc_2026_lp2_acessibilidade")
+                            pcd_qual = f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim")
+                            inst_parc = f.get("contact_custom_gc_2026_lp2_instituio_parceira") # Mantive o erro 'instituio' do seu CSV
                             tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
-                            
+                            regime = f.get("contact_custom_gc_2026_lp2_regime_trabalho")
+                            carga = f.get("contact_custom_gc_2026_lp2_turno_de_trabalho") # Mapeado conforme estrutura do seu CSV
+
                             conn.execute(text("""
-                                INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, escola, genero, etnia, trabalha, data_cadastro)
-                                VALUES (:p_id, '2026', :tri, :esc, :gen, :etn, :tra, :dt)
+                                INSERT INTO form_gc.lp2_respostas (
+                                    pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, 
+                                    semestre, turno_escola, genero, etnia, pcd, qual_pcd, 
+                                    instituicao_parceira, trabalha, regime, carga_horaria, data_cadastro
+                                )
+                                VALUES (
+                                    :p_id, '2026', :tri, :ens_med, :esc, :tip_esc, 
+                                    :semestre, :tur_esc, :gen, :etn, :pcd, :pcd_qual, 
+                                    :inst, :tra, :regime, :carga, :dt
+                                )
                                 ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
-                                    trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha
+                                    trilha = EXCLUDED.trilha,
+                                    ensino_medio = EXCLUDED.ensino_medio,
+                                    escola = EXCLUDED.escola,
+                                    tipo_escola = EXCLUDED.tipo_escola,
+                                    semestre = EXCLUDED.semestre,
+                                    turno_escola = EXCLUDED.turno_escola,
+                                    genero = EXCLUDED.genero,
+                                    etnia = EXCLUDED.etnia,
+                                    pcd = EXCLUDED.pcd,
+                                    qual_pcd = EXCLUDED.qual_pcd,
+                                    instituicao_parceira = EXCLUDED.instituicao_parceira,
+                                    trabalha = EXCLUDED.trabalha,
+                                    regime = EXCLUDED.regime,
+                                    carga_horaria = EXCLUDED.carga_horaria
                             """), {
-                                "p_id": pessoa_id, "tri": tri, "esc": esc, "gen": gen, "etn": etn, 
-                                "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não",
-                                "dt": format_timestamp(f.get('creation_date'))
+                                "p_id": pessoa_id, "tri": tri, "ens_med": ens_med, "esc": esc, "tip_esc": tip_esc,
+                                "semestre": semestre, "tur_esc": tur_esc, "gen": gen, "etn": etn, "pcd": pcd_val,
+                                "pcd_qual": pcd_qual, "inst": inst_parc, "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não",
+                                "regime": regime, "carga": carga, "dt": format_timestamp(f.get('creation_date'))
                             })
                 except Exception as e:
                     print(f"[ERRO] Usuário {summary.get('id')} não processado: {str(e)[:100]}")
