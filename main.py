@@ -71,14 +71,19 @@ def process():
         print(f"--- INICIANDO LOTE: {datetime.now().strftime('%H:%M:%S')} ---")
         
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            print(f"Buscando novos contatos da {handler}...")
+            print(f"Buscando novos contatos da {handler} (Lista ID: {list_id})...")
             url = "https://campuscaldeira.pipz.io/api/v1/contact/"
             params = {"list_id": list_id, "limit": 100, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
             
             res = requests.get(url, params=params)
-            if res.status_code != 200: continue
+            
+            # DIAGNÓSTICO: Se não for 200, avisa o motivo
+            if res.status_code != 200:
+                print(f"[ERRO API] Falha ao acessar {handler}. Status: {res.status_code}. Resposta: {res.text[:100]}")
+                continue
+                
             batch = res.json().get('objects', [])
-            print(f"Sincronizando {len(batch)} contatos...")
+            print(f"Encontrados {len(batch)} contatos. Iniciando sincronização...")
 
             for summary in batch:
                 try:
@@ -86,6 +91,7 @@ def process():
                     if not detail: continue
                     f = extract_fields_logic(detail)
                     
+                    # --- DADOS PESSOA ---
                     raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
                     nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                     final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
@@ -108,38 +114,29 @@ def process():
 
                         # --- LP1 ---
                         if handler == "lp1":
-                            sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem")
-                            cod = f.get("gc_2026_codigo_alumni") or f.get("[GC2026] codigo alumni") or f.get("contact_custom_gc2026_codigo_alumni") or f.get("gc2026_codigo_alumni")
+                            sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("contact_custom_gc_2026_lp1_origem")
+                            # Corrigido Alumni baseado no seu CSV (sem underline no gc2026)
+                            cod = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("contact_custom_gc2026_codigo_alumni")
+                            
                             conn.execute(text("""
                                 INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
                                 VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
                                 ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
                                     como_ficou_sabendo = EXCLUDED.como_ficou_sabendo,
                                     codigo_indicacao = EXCLUDED.codigo_indicacao
-                            """), {"p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
+                            """), {
+                                "p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), 
+                                "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))
+                            })
 
-                        # --- LP2 (Mapeamento Completo solicitado) ---
+                        # --- LP2 (Mapeamento Completo com 17 campos) ---
                         if handler == "lp2":
-                            # Campos complexos (Gênero e Etnia)
                             gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero"))
                             etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"), f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia"))
                             
-                            # Campos simples com fallbacks OR
-                            tri = f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional")
-                            esc = f.get("gc_2026_lp2_qual_escola") or f.get("Nome da escola") or f.get("contact_custom_gc_2026_lp2_qual_escola")
                             tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
                             
-                            # Novos campos mapeados da exportação
-                            ens_med = f.get("contact_custom_gc_2026_lp2_ensino_medio")
-                            tip_esc = f.get("contact_custom_gc_2026_escola_publica_ou_privada")
-                            semestre = f.get("contact_custom_gc_2026_lp2_qual_semestre_ano")
-                            tur_esc = f.get("contact_custom_gc_2026_lp2_qual_turno")
-                            pcd_val = f.get("contact_custom_gc_2026_lp2_acessibilidade")
-                            pcd_qual = f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim")
-                            inst_parc = f.get("contact_custom_gc_2026_lp2_instituio_parceira")
-                            regime = f.get("contact_custom_gc_2026_lp2_regime_trabalho")
-                            carga = f.get("contact_custom_gc_2026_lp2_turno_de_trabalho")
-
+                            # Mapeamento técnico baseado no seu CSV
                             conn.execute(text("""
                                 INSERT INTO form_gc.lp2_respostas (
                                     pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, 
@@ -161,13 +158,24 @@ def process():
                                     trabalha = EXCLUDED.trabalha, regime = EXCLUDED.regime,
                                     carga_horaria = EXCLUDED.carga_horaria
                             """), {
-                                "p_id": pessoa_id, "tri": tri, "ens_med": ens_med, "esc": esc, "tip_esc": tip_esc,
-                                "semestre": semestre, "tur_esc": tur_esc, "gen": gen, "etn": etn, "pcd": pcd_val,
-                                "pcd_qual": pcd_qual, "inst": inst_parc, "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não",
-                                "regime": regime, "carga": carga, "dt": format_timestamp(f.get('creation_date'))
+                                "p_id": pessoa_id,
+                                "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional"),
+                                "ens_med": f.get("contact_custom_gc_2026_lp2_ensino_medio"),
+                                "esc": f.get("gc_2026_lp2_qual_escola") or f.get("contact_custom_gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
+                                "tip_esc": f.get("contact_custom_gc_2026_escola_publica_ou_privada"),
+                                "semestre": f.get("contact_custom_gc_2026_lp2_qual_semestre_ano"),
+                                "tur_esc": f.get("contact_custom_gc_2026_lp2_qual_turno"),
+                                "gen": gen, "etn": etn,
+                                "pcd": f.get("contact_custom_gc_2026_lp2_acessibilidade"),
+                                "pcd_qual": f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim"),
+                                "inst": f.get("contact_custom_gc_2026_lp2_instituio_parceira"), # Mantido erro do CSV
+                                "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não",
+                                "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"),
+                                "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"),
+                                "dt": format_timestamp(f.get('creation_date'))
                             })
                 except Exception as e:
-                    print(f"[ERRO] Usuário {summary.get('id')} não processado: {str(e)[:100]}")
+                    print(f"[ERRO] Usuário {summary.get('id')} não processado: {str(e)[:150]}")
 
         print("--- LOTE FINALIZADO COM SUCESSO ---")
 
