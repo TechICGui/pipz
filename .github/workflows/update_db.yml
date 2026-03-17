@@ -2,7 +2,7 @@ name: Sincronizar Pipz com Google Cloud
 
 on:
   schedule:
-    - cron: '* * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
