@@ -26,7 +26,6 @@ def format_timestamp(ts_str):
     except: return None
 
 def normalize_genero(lp2, g2026, root):
-    """Prioriza formulários, depois sistema. Verifica Feminino primeiro por causa da letra 'h'."""
     val = lp2 or g2026 or root
     if not val: return "Não informado"
     txt = str(val).lower().strip()
@@ -46,15 +45,12 @@ def normalize_etnia(etnia, qual_etnia):
     return "Outra" if texto.strip() else None
 
 def extract_fields_logic(contact_full):
-    """Volta com a lógica de loop (Old Pessoas) + Busca Profunda"""
     if not contact_full: return {}
     data = {}
-    # Captura campos da raiz (email, name, mobile_phone, birthdate, etc)
+    # Lógica antiga de pessoas: captura raiz e depois fieldsets
     for k, v in contact_full.items():
         if not isinstance(v, (dict, list)):
             data[k] = v
-
-    # Captura campos dos Fieldsets
     for fs in contact_full.get('fieldsets', []):
         for field in fs.get('fields', []):
             name, label, val = field.get('name'), field.get('label'), field.get('value')
@@ -65,77 +61,98 @@ def extract_fields_logic(contact_full):
 def get_contact_detail(contact_id):
     url = f"https://campuscaldeira.pipz.io/api/v1/contact/{contact_id}/"
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
-    res = requests.get(url, params=params, headers={"Accept": "application/json"})
-    return res.json() if res.status_code == 200 else None
-
-def fetch_contact_list(list_id):
-    url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-    params = {"list_id": list_id, "limit": 250, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
-    res = requests.get(url, params=params)
-    return res.json().get('objects', []) if res.status_code == 200 else []
+    for _ in range(3):
+        res = requests.get(url, params=params, headers={"Accept": "application/json"})
+        if res.status_code == 200: return res.json()
+        elif res.status_code == 429:
+            print("Pipz ocupado... esperando 5 segundos")
+            time.sleep(5)
+    return None
 
 def process():
     if not DB_URL: return
     engine = create_engine(DB_URL)
     with engine.connect() as conn:
-        print("--- INICIANDO SINCRONIZAÇÃO (LIMITE 250) ---")
+        print(f"--- INICIANDO SINCRONIZAÇÃO COMPLETA: {datetime.now()} ---")
+        
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            summary_list = fetch_contact_list(list_id)
-            print(f"Processando {handler}...")
-            for summary in summary_list:
-                detail = get_contact_detail(summary['id'])
-                f = extract_fields_logic(detail)
-                if not f: continue
+            offset = 0
+            limit = 100
+            
+            while True: # LOOP ATÉ ACABAREM OS DADOS
+                print(f"Buscando lista {handler} (Offset: {offset})...")
+                url = "https://campuscaldeira.pipz.io/api/v1/contact/"
+                params = {
+                    "list_id": list_id, 
+                    "limit": limit, 
+                    "offset": offset,
+                    "api_key": PIPZ_KEY, 
+                    "api_secret": PIPZ_SECRET
+                }
+                
+                res = requests.get(url, params=params)
+                if res.status_code != 200: break
+                
+                batch = res.json().get('objects', [])
+                if not batch: break # Se a página vier vazia, para o loop
+                
+                for summary in batch:
+                    detail = get_contact_detail(summary['id'])
+                    f = extract_fields_logic(detail)
+                    if not f: continue
 
-                # PESSOA (Voltei ao mapeamento original que você disse estar perfeito)
-                raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
-                nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
-                final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f['id']}"
-                birth = format_date_to_db(f.get('birthdate') or f.get('birthday'))
-                tel = f.get('mobile_phone') or f.get('phone') or f.get('telefone')
-                dt_cad = format_timestamp(f.get('creation_date'))
+                    # PESSOA (Código antigo estável)
+                    raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
+                    nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
+                    final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id', 'N/A')}"
+                    birth = format_date_to_db(f.get('birthdate') or f.get('birthday'))
+                    tel = f.get('mobile_phone') or f.get('phone') or f.get('telefone')
+                    dt_cad = format_timestamp(f.get('creation_date'))
 
-                with conn.begin():
-                    try:
-                        conn.execute(text("""
-                            INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
-                            VALUES (:cpf, :email, :nome, :birth, :tel)
-                            ON CONFLICT (cpf) DO UPDATE SET email = EXCLUDED.email, nome = EXCLUDED.nome, 
-                            data_nascimento = COALESCE(EXCLUDED.data_nascimento, form_gc.pessoas.data_nascimento),
-                            telefone = COALESCE(EXCLUDED.telefone, form_gc.pessoas.telefone)
-                        """), {"cpf": final_cpf, "email": f.get('email'), "nome": f.get('name'), "birth": birth, "tel": tel})
-
-                        if handler == "lp1":
-                            # Refinado Fallback de 'como ficou sabendo'
-                            sabendo = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("[GC 2026 LP1] Origem")
-                            alumni = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("[GC2026] codigo alumni")
-                            
+                    with conn.begin():
+                        try:
+                            # UPSERT PESSOA
                             conn.execute(text("""
-                                INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
-                                VALUES ((SELECT id FROM form_gc.pessoas WHERE cpf = :cpf), '2026', :est, :cid, :sab, :cod, :dt, NOW())
-                                ON CONFLICT (pessoa_id, edicao) DO UPDATE SET como_ficou_sabendo = EXCLUDED.como_ficou_sabendo, codigo_indicacao = EXCLUDED.codigo_indicacao
-                            """), {"cpf": final_cpf, "est": f.get('state'), "cid": f.get('city_name'), "sab": sabendo, "cod": alumni, "dt": dt_cad})
+                                INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
+                                VALUES (:cpf, :email, :nome, :birth, :tel)
+                                ON CONFLICT (cpf) DO UPDATE SET 
+                                    email = COALESCE(EXCLUDED.email, form_gc.pessoas.email),
+                                    nome = COALESCE(EXCLUDED.nome, form_gc.pessoas.nome),
+                                    data_nascimento = COALESCE(EXCLUDED.data_nascimento, form_gc.pessoas.data_nascimento),
+                                    telefone = COALESCE(EXCLUDED.telefone, form_gc.pessoas.telefone)
+                            """), {"cpf": final_cpf, "email": f.get('email'), "nome": f.get('name'), "birth": birth, "tel": tel})
 
-                        if handler == "lp2":
-                            gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'))
-                            etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"))
-                            
-                            # Trabalho (Lógica Power BI)
-                            trab_lp2 = str(f.get("gc_2026_lp2_voce_trabalha") or "").lower()
-                            trab_emp = str(f.get("_gc_2026_lp2_voc_trabalha_em_alguma_empresa") or "").lower()
-                            tra = "Sim" if "sim" in trab_lp2 else "Não" if "n" in trab_lp2 else ("Não" if "n" in trab_emp or trab_emp == "" else "Sim")
+                            if handler == "lp1":
+                                sabendo = f.get("gc_2026_lp1_origem") or f.get("[GC 2026 LP1] Origem") or f.get("[2025] Como ficou sabendo do Geração Caldeira?")
+                                alumni = f.get("gc_2026_codigo_alumni") or f.get("gc2026_codigo_alumni") or f.get("[GC2026] codigo alumni")
+                                conn.execute(text("""
+                                    INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
+                                    VALUES ((SELECT id FROM form_gc.pessoas WHERE cpf = :cpf), '2026', :est, :cid, :sab, :cod, :dt, NOW())
+                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET como_ficou_sabendo = EXCLUDED.como_ficou_sabendo, codigo_indicacao = EXCLUDED.codigo_indicacao
+                                """), {"cpf": final_cpf, "est": f.get('state'), "cid": f.get('city_name'), "sab": sabendo, "cod": alumni, "dt": dt_cad})
 
-                            conn.execute(text("""
-                                INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, escola, genero, etnia, trabalha, data_cadastro)
-                                VALUES ((SELECT id FROM form_gc.pessoas WHERE cpf = :cpf), '2026', :tri, :esc, :gen, :etn, :tra, :dt)
-                                ON CONFLICT (pessoa_id, edicao) DO UPDATE SET trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha
-                            """), {
-                                "cpf": final_cpf, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("[GC 2026 LP2] trilha educacional"),
-                                "esc": f.get("gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
-                                "gen": gen, "etn": etn, "tra": tra, "dt": dt_cad
-                            })
-                    except Exception as e:
-                        print(f"Erro ID {f.get('id', 'N/A')}: {e}")
+                            if handler == "lp2":
+                                gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'))
+                                etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"))
+                                trab_lp2 = str(f.get("gc_2026_lp2_voce_trabalha") or "").lower()
+                                trab_emp = str(f.get("_gc_2026_lp2_voc_trabalha_em_alguma_empresa") or "").lower()
+                                tra = "Sim" if "sim" in trab_lp2 else "Não" if "n" in trab_lp2 else ("Não" if "n" in trab_emp or trab_emp == "" else "Sim")
+
+                                conn.execute(text("""
+                                    INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, escola, genero, etnia, trabalha, data_cadastro)
+                                    VALUES ((SELECT id FROM form_gc.pessoas WHERE cpf = :cpf), '2026', :tri, :esc, :gen, :etn, :tra, :dt)
+                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha
+                                """), {
+                                    "cpf": final_cpf, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("[GC 2026 LP2] trilha educacional"),
+                                    "esc": f.get("gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
+                                    "gen": gen, "etn": etn, "tra": tra, "dt": dt_cad
+                                })
+                        except Exception as e:
+                            print(f"Erro ID {f.get('id', 'N/A')}: {e}")
+                
+                offset += limit # Vai para a próxima página
+                time.sleep(1) # Pausa de 1s para não sobrecarregar a API
+                
         print("--- SYNC FINALIZADO ---")
 
 if __name__ == "__main__":
