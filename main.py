@@ -58,7 +58,7 @@ def get_contact_detail(contact_id):
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
     res = requests.get(url, params=params, headers={"Accept": "application/json"})
     if res.status_code == 429:
-        time.sleep(10)
+        time.sleep(5)
         return None
     return res.json() if res.status_code == 200 else None
 
@@ -67,41 +67,61 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        # Pega o total atual e encerra a transação imediatamente para evitar o erro de 'already initialized'
-        total_no_banco = conn.execute(text("SELECT count(*) FROM form_gc.pessoas")).scalar()
-        conn.commit() 
-        
         print(f"--- INICIANDO LOTE: {datetime.now().strftime('%H:%M:%S')} ---")
-        print(f"Total atual no banco: {total_no_banco}")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            # Processa 50 novos e 50 antigos por rodada (Total 100 por lista)
-            for current_offset in [0, total_no_banco]:
-                print(f"Buscando {handler} (Offset: {current_offset})...")
+            print(f"\n--- Sincronizando {handler.upper()} ---")
+            offset = 0
+            limit = 100
+            detalhes_buscados = 0
+            max_detalhes_por_lista = 250 # Cota de API para não tomar bloqueio do Pipz
+            
+            while True:
+                if detalhes_buscados >= max_detalhes_por_lista:
+                    print(f"[{handler}] Limite de segurança da API atingido. Continuará na próxima rodada.")
+                    break
+
                 url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-                params = {"list_id": list_id, "limit": 50, "offset": current_offset, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
-                
+                params = {"list_id": list_id, "limit": limit, "offset": offset, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
                 res = requests.get(url, params=params)
-                if res.status_code != 200: continue
+                
+                if res.status_code != 200: break
                 batch = res.json().get('objects', [])
+                if not batch: break
+                
+                novos_nesta_pagina = 0
                 
                 for summary in batch:
-                    try:
-                        # Verifica se já temos a trilha para economizar API
-                        check = conn.execute(text("SELECT 1 FROM form_gc.lp2_respostas WHERE pessoa_id = (SELECT id FROM form_gc.pessoas WHERE cpf = :cpf OR email = :email LIMIT 1) AND trilha IS NOT NULL"), 
-                                            {"cpf": f"ID_{summary['id']}", "email": summary.get('email')}).fetchone()
-                        conn.commit()
-                        if check: continue 
-
-                        detail = get_contact_detail(summary['id'])
-                        if not detail: continue
+                    email = summary.get('email')
+                    
+                    # 1. VERIFICAÇÃO SUPER RÁPIDA (Pula quem já está no banco)
+                    if email:
+                        tabela_alvo = "lp1_respostas" if handler == "lp1" else "lp2_respostas"
+                        query_check = text(f"""
+                            SELECT 1 FROM form_gc.{tabela_alvo} r 
+                            JOIN form_gc.pessoas p ON p.id = r.pessoa_id 
+                            WHERE p.email = :email LIMIT 1
+                        """)
+                        ja_existe = conn.execute(query_check, {"email": email}).fetchone()
+                        conn.commit() # Libera o banco para a próxima query
+                        
+                        if ja_existe:
+                            continue # Pula instantaneamente sem chamar o Pipz
+                    
+                    # 2. SE É NOVO, BUSCA O DETALHE E SALVA
+                    if detalhes_buscados >= max_detalhes_por_lista:
+                        break # Para o loop interno se bater a cota
+                        
+                    detail = get_contact_detail(summary['id'])
+                    if detail:
+                        detalhes_buscados += 1
+                        novos_nesta_pagina += 1
                         f = extract_fields_logic(detail)
                         
                         raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
                         nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                         final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
 
-                        # Bloco de escrita com transação isolada
                         with conn.begin():
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
@@ -143,9 +163,10 @@ def process():
                                     "gen": gen, "etn": etn, "pcd": f.get("contact_custom_gc_2026_lp2_acessibilidade"), "pcd_qual": f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim"), "inst": f.get("contact_custom_gc_2026_lp2_instituio_parceira"),
                                     "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não", "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"), "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"), "dt": format_timestamp(f.get('creation_date'))
                                 })
-                    except Exception as e:
-                        print(f"[ERRO] Usuário {summary.get('id')} falhou: {str(e)[:100]}")
-
+                
+                print(f"Página (Offset {offset}): {novos_nesta_pagina} novos processados, {len(batch) - novos_nesta_pagina} já existiam (pulados).")
+                offset += limit
+                
         print("--- LOTE FINALIZADO ---")
 
 if __name__ == "__main__":
