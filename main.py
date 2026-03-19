@@ -15,7 +15,9 @@ def format_date_to_db(date_str):
     if not date_str or str(date_str).lower() in ["none", "null", ""]: return None
     clean = str(date_str)[:10].replace("/", "-")
     try: return datetime.strptime(clean, "%Y-%m-%d").strftime("%Y-%m-%d")
-    except: return None
+    except:
+        try: return datetime.strptime(clean, "%d-%m-%Y").strftime("%Y-%m-%d")
+        except: return None
 
 def format_timestamp(ts_str):
     if not ts_str: return None
@@ -54,6 +56,7 @@ def extract_fields_logic(contact_full):
     return data
 
 def get_contact_detail(contact_id):
+    """Fallback: Só chama se faltar dado na lista."""
     url = f"https://campuscaldeira.pipz.io/api/v1/contact/{contact_id}/"
     params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
     res = requests.get(url, params=params, headers={"Accept": "application/json"})
@@ -67,61 +70,48 @@ def process():
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO LOTE: {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"--- INICIANDO VARREDURA TOTAL: {datetime.now().strftime('%H:%M:%S')} ---")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            print(f"\n--- Sincronizando {handler.upper()} ---")
             offset = 0
             limit = 100
-            detalhes_buscados = 0
-            max_detalhes_por_lista = 250 # Cota de API para não tomar bloqueio do Pipz
             
             while True:
-                if detalhes_buscados >= max_detalhes_por_lista:
-                    print(f"[{handler}] Limite de segurança da API atingido. Continuará na próxima rodada.")
-                    break
-
+                print(f"[{handler}] Lendo página (Offset {offset})...")
                 url = "https://campuscaldeira.pipz.io/api/v1/contact/"
-                params = {"list_id": list_id, "limit": limit, "offset": offset, "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
+                # O SEGREDO ESTÁ AQUI: include_fieldsets=1 faz o Pipz mandar TUDO na lista
+                params = {
+                    "list_id": list_id, "limit": limit, "offset": offset, 
+                    "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET,
+                    "include_fieldsets": "1", "extra_fields": "1"
+                }
+                
                 res = requests.get(url, params=params)
-                
                 if res.status_code != 200: break
-                batch = res.json().get('objects', [])
-                if not batch: break
                 
-                novos_nesta_pagina = 0
+                batch = res.json().get('objects', [])
+                if not batch: 
+                    print(f"[{handler}] Fim da lista alcançado!")
+                    break
                 
                 for summary in batch:
-                    email = summary.get('email')
-                    
-                    # 1. VERIFICAÇÃO SUPER RÁPIDA (Pula quem já está no banco)
-                    if email:
-                        tabela_alvo = "lp1_respostas" if handler == "lp1" else "lp2_respostas"
-                        query_check = text(f"""
-                            SELECT 1 FROM form_gc.{tabela_alvo} r 
-                            JOIN form_gc.pessoas p ON p.id = r.pessoa_id 
-                            WHERE p.email = :email LIMIT 1
-                        """)
-                        ja_existe = conn.execute(query_check, {"email": email}).fetchone()
-                        conn.commit() # Libera o banco para a próxima query
-                        
-                        if ja_existe:
-                            continue # Pula instantaneamente sem chamar o Pipz
-                    
-                    # 2. SE É NOVO, BUSCA O DETALHE E SALVA
-                    if detalhes_buscados >= max_detalhes_por_lista:
-                        break # Para o loop interno se bater a cota
-                        
-                    detail = get_contact_detail(summary['id'])
-                    if detail:
-                        detalhes_buscados += 1
-                        novos_nesta_pagina += 1
-                        f = extract_fields_logic(detail)
+                    try:
+                        # Extrai os dados DIRETO da lista (sem chamar a API de detalhe)
+                        f = extract_fields_logic(summary)
                         
                         raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
+                        
+                        # Se por acaso o Pipz não mandou o CPF na lista, aí sim pedimos o detalhe
+                        if not raw_cpf:
+                            detail = get_contact_detail(summary['id'])
+                            if detail:
+                                f = extract_fields_logic(detail)
+                                raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
+
                         nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
                         final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
 
+                        # Abre a transação para gravar no banco
                         with conn.begin():
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
@@ -155,7 +145,7 @@ def process():
                                 conn.execute(text("""
                                     INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, semestre, turno_escola, genero, etnia, pcd, qual_pcd, instituicao_parceira, trabalha, regime, carga_horaria, data_cadastro)
                                     VALUES (:p_id, '2026', :tri, :ens_med, :esc, :tip_esc, :semestre, :tur_esc, :gen, :etn, :pcd, :pcd_qual, :inst, :tra, :regime, :carga, :dt)
-                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha
+                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha, ensino_medio = EXCLUDED.ensino_medio, escola = EXCLUDED.escola, tipo_escola = EXCLUDED.tipo_escola, semestre = EXCLUDED.semestre, turno_escola = EXCLUDED.turno_escola, pcd = EXCLUDED.pcd, qual_pcd = EXCLUDED.qual_pcd, instituicao_parceira = EXCLUDED.instituicao_parceira, regime = EXCLUDED.regime, carga_horaria = EXCLUDED.carga_horaria
                                 """), {
                                     "p_id": pessoa_id, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional"),
                                     "ens_med": f.get("contact_custom_gc_2026_lp2_ensino_medio"), "esc": f.get("gc_2026_lp2_qual_escola") or f.get("contact_custom_gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
@@ -163,11 +153,20 @@ def process():
                                     "gen": gen, "etn": etn, "pcd": f.get("contact_custom_gc_2026_lp2_acessibilidade"), "pcd_qual": f.get("contact_custom_gc_2026_lp2_acessibilidade_se_sim"), "inst": f.get("contact_custom_gc_2026_lp2_instituio_parceira"),
                                     "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não", "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"), "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"), "dt": format_timestamp(f.get('creation_date'))
                                 })
+                    except Exception as e:
+                        print(f"[ERRO] Usuário {summary.get('id')} falhou: {str(e)[:100]}")
                 
-                print(f"Página (Offset {offset}): {novos_nesta_pagina} novos processados, {len(batch) - novos_nesta_pagina} já existiam (pulados).")
                 offset += limit
+                time.sleep(0.5) # Pausa curtinha só pra API não chiar
                 
-        print("--- LOTE FINALIZADO ---")
+                # --- TRAVA PARA USO DIÁRIO ---
+                # DEPOIS que você rodar esse script uma vez e ele carregar as 40.000 pessoas,
+                # tire o "#" da linha abaixo para que o robô do Github não fique 
+                # lendo a base inteira a cada 20 minutos (lendo só as 10 primeiras páginas).
+                #
+                # if offset >= 1000: break
+
+        print("--- VARREDURA FINALIZADA COM SUCESSO ---")
 
 if __name__ == "__main__":
     process()
