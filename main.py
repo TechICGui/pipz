@@ -55,76 +55,57 @@ def extract_fields_logic(contact_full):
             if label: data[label] = val
     return data
 
-def get_contact_detail(contact_id):
-    url = f"https://campuscaldeira.pipz.io/api/v1/contact/{contact_id}/"
-    params = {"extra_fields": "1", "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET}
-    res = requests.get(url, params=params, headers={"Accept": "application/json"})
-    if res.status_code == 429:
-        time.sleep(5) # Respira um pouco se o Pipz chiar
-        return None
-    return res.json() if res.status_code == 200 else None
-
 def process():
     if not DB_URL: return
     engine = create_engine(DB_URL)
     
     with engine.connect() as conn:
-        print(f"--- INICIANDO CARGA RÁPIDA (Retomar): {datetime.now().strftime('%H:%M:%S')} ---")
+        print(f"--- INICIANDO VARREDURA TOTAL TURBO: {datetime.now().strftime('%H:%M:%S')} ---")
 
         for list_id, handler in [("141", "lp1"), ("144", "lp2")]:
-            print(f"\n[{handler.upper()}] Buscando contatos...")
+            print(f"\n--- Sincronizando {handler.upper()} (Lista {list_id}) ---")
             offset = 0
             limit = 100
             
             while True:
                 url = "https://campuscaldeira.pipz.io/api/v1/contact/"
+                # include_fieldsets=1 é o segredo que traz tudo na lista
                 params = {
                     "list_id": list_id, "limit": limit, "offset": offset, 
                     "api_key": PIPZ_KEY, "api_secret": PIPZ_SECRET,
                     "include_fieldsets": "1", "extra_fields": "1"
                 }
                 
-                res = requests.get(url, params=params)
-                if res.status_code != 200: break
+                # TENTA 3 VEZES SE O PIPZ FALHAR
+                success = False
+                for attempt in range(3):
+                    res = requests.get(url, params=params)
+                    if res.status_code == 200:
+                        success = True
+                        break
+                    else:
+                        time.sleep(5) # Respira 5s se a API chiar
+                        
+                if not success:
+                    print(f"[{handler}] Parando na página {offset}. Erro do Pipz: {res.status_code} - {res.text[:100]}")
+                    break
                 
                 batch = res.json().get('objects', [])
-                if not batch: break
-                
-                novos_processados = 0
+                if not batch: 
+                    print(f"[{handler}] Fim da lista! Todos os registros processados.")
+                    break
                 
                 for summary in batch:
+                    # Sem chamadas secundárias! Pega os dados que já vieram da lista.
+                    f = extract_fields_logic(summary)
+                    
+                    raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
+                    nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
+                    final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{summary.get('id')}"
+
                     try:
-                        email = summary.get('email')
-                        
-                        # --- O PULO DO GATO (Ignora quem já tá no banco) ---
-                        if email:
-                            tabela = "lp1_respostas" if handler == "lp1" else "lp2_respostas"
-                            check = conn.execute(text(f"""
-                                SELECT 1 FROM form_gc.{tabela} r
-                                JOIN form_gc.pessoas p ON p.id = r.pessoa_id
-                                WHERE p.email = :email LIMIT 1
-                            """), {"email": email}).fetchone()
-                            conn.commit() # Libera transação
-                            
-                            if check:
-                                continue # PULA INSTANTANEAMENTE!
-
-                        # Se chegou aqui, é porque a pessoa é NOVA (ou falta essa tabela)
-                        novos_processados += 1
-                        
-                        f = extract_fields_logic(summary)
-                        raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
-                        
-                        if not raw_cpf:
-                            detail = get_contact_detail(summary['id'])
-                            if detail:
-                                f = extract_fields_logic(detail)
-                                raw_cpf = f.get("gc_2026_lp1_cpf") or f.get("gc_2026_lp2_cpf") or f.get("CPF") or f.get("cpf")
-
-                        nums_cpf = re.sub(r'\D', '', str(raw_cpf)) if raw_cpf else None
-                        final_cpf = nums_cpf if nums_cpf and len(nums_cpf) >= 11 else f"ID_{f.get('id')}"
-
                         with conn.begin():
+                            # UPSERT PESSOA
                             p_res = conn.execute(text("""
                                 INSERT INTO form_gc.pessoas (cpf, email, nome, data_nascimento, telefone)
                                 VALUES (:cpf, :email, :nome, :birth, :tel)
@@ -140,6 +121,7 @@ def process():
                             })
                             pessoa_id = p_res.fetchone()[0]
 
+                            # UPSERT LP1
                             if handler == "lp1":
                                 sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("contact_custom_gc_2026_lp1_origem")
                                 cod = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("contact_custom_gc2026_codigo_alumni")
@@ -149,15 +131,32 @@ def process():
                                     ON CONFLICT (pessoa_id, edicao) DO UPDATE SET como_ficou_sabendo = EXCLUDED.como_ficou_sabendo, codigo_indicacao = EXCLUDED.codigo_indicacao
                                 """), {"p_id": pessoa_id, "est": f.get('state'), "cid": f.get('city_name'), "sab": sab, "cod": cod, "dt": format_timestamp(f.get('creation_date'))})
 
+                            # UPSERT LP2
                             if handler == "lp2":
                                 gen = normalize_genero(f.get("gc_2026_lp2_genero"), f.get("gc_2026_genero"), f.get('gender'), f.get("contact_custom_gc_2026_lp2_genero"))
                                 etn = normalize_etnia(f.get("gc_2026_lp2_etnia"), f.get("gc_2026_lp2_qual_etnia"), f.get("contact_custom_gc_2026_lp2_etnia"), f.get("contact_custom_gc_2026_lp2_qual_etnia"))
                                 tra_val = f.get("gc_2026_lp2_voce_trabalha") or f.get("contact_custom_gc_2026_lp2_voce_trabalha")
                                 
                                 conn.execute(text("""
-                                    INSERT INTO form_gc.lp2_respostas (pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, semestre, turno_escola, genero, etnia, pcd, qual_pcd, instituicao_parceira, trabalha, regime, carga_horaria, data_cadastro)
-                                    VALUES (:p_id, '2026', :tri, :ens_med, :esc, :tip_esc, :semestre, :tur_esc, :gen, :etn, :pcd, :pcd_qual, :inst, :tra, :regime, :carga, :dt)
-                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET trilha = EXCLUDED.trilha, genero = EXCLUDED.genero, etnia = EXCLUDED.etnia, trabalha = EXCLUDED.trabalha, ensino_medio = EXCLUDED.ensino_medio, escola = EXCLUDED.escola, tipo_escola = EXCLUDED.tipo_escola, semestre = EXCLUDED.semestre, turno_escola = EXCLUDED.turno_escola, pcd = EXCLUDED.pcd, qual_pcd = EXCLUDED.qual_pcd, instituicao_parceira = EXCLUDED.instituicao_parceira, regime = EXCLUDED.regime, carga_horaria = EXCLUDED.carga_horaria
+                                    INSERT INTO form_gc.lp2_respostas (
+                                        pessoa_id, edicao, trilha, ensino_medio, escola, tipo_escola, 
+                                        semestre, turno_escola, genero, etnia, pcd, qual_pcd, 
+                                        instituicao_parceira, trabalha, regime, carga_horaria, data_cadastro
+                                    )
+                                    VALUES (
+                                        :p_id, '2026', :tri, :ens_med, :esc, :tip_esc, 
+                                        :semestre, :tur_esc, :gen, :etn, :pcd, :pcd_qual, 
+                                        :inst, :tra, :regime, :carga, :dt
+                                    )
+                                    ON CONFLICT (pessoa_id, edicao) DO UPDATE SET 
+                                        trilha = EXCLUDED.trilha, ensino_medio = EXCLUDED.ensino_medio,
+                                        escola = EXCLUDED.escola, tipo_escola = EXCLUDED.tipo_escola,
+                                        semestre = EXCLUDED.semestre, turno_escola = EXCLUDED.turno_escola,
+                                        genero = EXCLUDED.genero, etnia = EXCLUDED.etnia,
+                                        pcd = EXCLUDED.pcd, qual_pcd = EXCLUDED.qual_pcd,
+                                        instituicao_parceira = EXCLUDED.instituicao_parceira,
+                                        trabalha = EXCLUDED.trabalha, regime = EXCLUDED.regime,
+                                        carga_horaria = EXCLUDED.carga_horaria
                                 """), {
                                     "p_id": pessoa_id, "tri": f.get("gc_2026_lp2_trilha_educacional") or f.get("contact_custom_gc_2026_lp2_trilha_educacional"),
                                     "ens_med": f.get("contact_custom_gc_2026_lp2_ensino_medio"), "esc": f.get("gc_2026_lp2_qual_escola") or f.get("contact_custom_gc_2026_lp2_qual_escola") or f.get("Nome da escola"),
@@ -166,12 +165,16 @@ def process():
                                     "tra": "Sim" if "sim" in str(tra_val or "").lower() else "Não", "regime": f.get("contact_custom_gc_2026_lp2_regime_trabalho"), "carga": f.get("contact_custom_gc_2026_lp2_turno_de_trabalho"), "dt": format_timestamp(f.get('creation_date'))
                                 })
                     except Exception as e:
-                        print(f"[ERRO] Usuário {summary.get('id')} falhou: {str(e)[:100]}")
+                        print(f"[ERRO BANCO] Falha ao gravar ID {summary.get('id')}: {str(e)[:100]}")
                 
-                print(f"Página (Offset {offset}): {novos_processados} API Chamadas, {100 - novos_processados} existiam e foram pulados.")
+                print(f"[{handler}] Página (Offset {offset}): {len(batch)} usuários processados/atualizados.")
                 offset += limit
                 
-        print("--- CARGA RÁPIDA FINALIZADA ---")
+                # --- USO DIÁRIO DE ROTINA (20 min) ---
+                # Apenas remova o "#" da linha abaixo DEPOIS que essa carga massiva inteira for concluída.
+                # if offset >= 500: break
+                
+        print("\n--- VARREDURA FINALIZADA COM SUCESSO ---")
 
 if __name__ == "__main__":
     process()
