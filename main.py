@@ -196,7 +196,7 @@ def process():
 
                             if handler == "lp1":
                                 sab = f.get("[2025] Como ficou sabendo do Geração Caldeira?") or f.get("gc_2026_lp1_origem") or f.get("contact_custom_gc_2026_lp1_origem")
-                                cod = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("contact_custom_gc2026_codigo_alumni")
+                                cod = f.get("gc2026_codigo_alumni") or f.get("gc_2026_codigo_alumni") or f.get("contact_custom_gc2026_codigo_alumni") or f.get("[2026]_codigo_alumni")
                                 conn.execute(text("""
                                     INSERT INTO form_gc.lp1_respostas (pessoa_id, edicao, estado, cidade, como_ficou_sabendo, codigo_indicacao, data_cadastro, data_resposta)
                                     VALUES (:p_id, '2026', :est, :cid, :sab, :cod, :dt, NOW())
